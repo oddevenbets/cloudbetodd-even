@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import firebase_admin
 from firebase_admin import credentials, db
-import os, json, random
+import os, json, random, threading
 
 # ----------------------------------------------------
 # Firebase setup (from environment variable)
@@ -41,32 +41,35 @@ headers = {
 
 # Global variables
 active_bets = {}
-executor = ThreadPoolExecutor(max_workers=10)
+executor = ThreadPoolExecutor(max_workers=5)  # reduced workers for safety
 
 # ----------------------------------------------------
-# Firebase Helpers
+# Global Rate Limiter (max 1 request/sec to stay well under 2 RPS)
 # ----------------------------------------------------
-def save_event_id(event_id):
-    """Save an event ID into Firebase Realtime DB with timestamp"""
-    ref = events_ref.child(str(event_id))
-    ref.set({"created_at": datetime.utcnow().isoformat()})
+RATE_LIMIT_LOCK = threading.Lock()
+LAST_CALL_TIME = 0
+MIN_INTERVAL = 1.0  # 1 second between requests
 
-def load_existing_event_ids():
-    """Load all event IDs from Firebase Realtime DB"""
-    snapshot = events_ref.get()
-    if snapshot:
-        return set(snapshot.keys())
-    return set()
+def rate_limited_request(method, url, **kwargs):
+    """Perform a request respecting Cloudbet's 2RPS limit (we enforce 1RPS)."""
+    global LAST_CALL_TIME
+    with RATE_LIMIT_LOCK:
+        now = time.time()
+        elapsed = now - LAST_CALL_TIME
+        if elapsed < MIN_INTERVAL:
+            time.sleep(MIN_INTERVAL - elapsed + random.uniform(0.05, 0.2))  # add jitter
+        LAST_CALL_TIME = time.time()
+    return safe_request(method, url, **kwargs)
 
 # ----------------------------------------------------
-# Cloudbet API Helpers (with backoff + jitter)
+# Safe Request with Backoff
 # ----------------------------------------------------
 def safe_request(method, url, **kwargs):
-    """Perform a request with exponential backoff + jitter to avoid 429 errors"""
+    """Perform a request with exponential backoff if Cloudbet returns errors."""
     backoff = 5
-    max_backoff = 600  # 10 minutes
+    max_backoff = 600  # cap at 10 minutes
 
-    for attempt in range(10):  # max 10 retries
+    for attempt in range(8):
         try:
             response = requests.request(method, url, headers=headers, timeout=10, **kwargs)
 
@@ -88,17 +91,28 @@ def safe_request(method, url, **kwargs):
     return None
 
 # ----------------------------------------------------
+# Firebase Helpers
+# ----------------------------------------------------
+def save_event_id(event_id):
+    """Save an event ID into Firebase Realtime DB with timestamp"""
+    ref = events_ref.child(str(event_id))
+    ref.set({"created_at": datetime.utcnow().isoformat()})
+
+def load_existing_event_ids():
+    """Load all event IDs from Firebase Realtime DB"""
+    snapshot = events_ref.get()
+    if snapshot:
+        return set(snapshot.keys())
+    return set()
+
+# ----------------------------------------------------
 # Betting Functions
 # ----------------------------------------------------
 def get_all_live_basketball_events():
     logging.info("\nSearching for all live basketball events...")
-    params = {
-        "sport": "basketball",
-        "live": "true",
-        "markets": "basketball.odd_even"
-    }
+    params = {"sport": "basketball", "live": "true", "markets": "basketball.odd_even"}
 
-    response = safe_request("GET", f"{FEED_API_URL}/events", params=params)
+    response = rate_limited_request("GET", f"{FEED_API_URL}/events", params=params)
     if not response:
         return []
 
@@ -128,7 +142,7 @@ def get_all_live_basketball_events():
 
 def get_odd_even_market(event_id):
     params = {"markets": "basketball.odd_even"}
-    response = safe_request("GET", f"{FEED_API_URL}/events/{event_id}", params=params)
+    response = rate_limited_request("GET", f"{FEED_API_URL}/events/{event_id}", params=params)
     if not response:
         return None
 
@@ -158,7 +172,7 @@ def place_bet(event_info, stake_per_side=1.0):
             "acceptPriceChange": "BETTER"
         }
 
-        response = safe_request("POST", f"{TRADING_API_URL}/place", json=bet_payload)
+        response = rate_limited_request("POST", f"{TRADING_API_URL}/place", json=bet_payload)
         if not response:
             logging.error(f"❌ Failed to place {side} bet on {event_info['event_name']}")
             continue
@@ -166,7 +180,6 @@ def place_bet(event_info, stake_per_side=1.0):
         bet_response = response.json()
         bets_placed.append(bet_response)
 
-        # Save event ID in Firebase
         save_event_id(event_info['event_id'])
 
         logging.info(f"\n🎯 Placed {side} bet:")
@@ -188,12 +201,12 @@ def place_bet(event_info, stake_per_side=1.0):
     return bets_placed
 
 def check_bet_status(reference_id):
-    response = safe_request("GET", f"{TRADING_API_URL}/{reference_id}/status")
+    response = rate_limited_request("GET", f"{TRADING_API_URL}/{reference_id}/status")
     if response:
         return response.json()
     return None
 
-def monitor_bet(reference_id, max_checks=60, base_interval=30):
+def monitor_bet(reference_id, max_checks=60, base_interval=45):
     terminal_states = [
         'ACCEPTED', 'REJECTED', 'WIN', 'LOSS', 'PUSH',
         'MARKET_SUSPENDED', 'INSUFFICIENT_FUNDS', 'CANCELLED'
@@ -212,7 +225,7 @@ def monitor_bet(reference_id, max_checks=60, base_interval=30):
             else:
                 logging.info(f"ℹ️ Bet {reference_id} still {status['status']}")
 
-        # Wait before next check (base interval + jitter)
+        # Wait before next check (longer interval + jitter)
         sleep_time = base_interval + random.uniform(5, 15)
         time.sleep(sleep_time)
 
